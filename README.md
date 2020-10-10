@@ -1,9 +1,9 @@
 # socks5Server
 a socks5 server base on libevent
 ## usage
-`cd src`
-`cmake`
-`make`
+`cd src`  
+`cmake`  
+`make`  
 after a while, you would see a file named socks5Server;  
 you should create a property file before start the server. the file as follow：  
 ```
