@@ -4,8 +4,8 @@ a socks5 server base on libevent
 `cd src`
 `cmake`
 `make`
-after a while, you would see a file named socks5Server;
-you should create a property file before start the server. the file as follow：
+after a while, you would see a file named socks5Server;  
+you should create a property file before start the server. the file as follow：  
 ```
 CLIENT_TTL = 600 
 #if a client connection has no data transport for CLIENT_TTL seconds,server would close the connection 
@@ -23,6 +23,6 @@ THREADS = 4
 [accounts]
 danny = passwd  
 ```
-save it as server.config and move it to the directory which saved socks5Server
-then enter: ./socks5Server the server will automatically load the properties name server.config in current work directory you can also use the path what you want just add the path after that command like
+save it as server.config and move it to the directory which saved socks5Server  
+then enter: ./socks5Server the server will automatically load the properties name server.config in current work directory you can also use the path what you want just add the path after that command like  
 `./socks5Server <path>`
