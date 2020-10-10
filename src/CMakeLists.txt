@@ -8,3 +8,5 @@ add_executable(socks5Server main.cpp Socks5Server.cpp Socks5Server.h Protocol.cp
 target_link_libraries(socks5Server libevent.a)
 target_link_libraries(socks5Server pthread)
 target_link_libraries(socks5Server config_parser)
+
+
