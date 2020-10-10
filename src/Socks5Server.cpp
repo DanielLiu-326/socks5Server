@@ -472,7 +472,7 @@ void Socks5Server::onUpConWriteEvent(int fd, short events, void *args)
         if(sndLen<0)
         {
             //error occurred;
-            closeClient(upCon.fd);
+            closeClient(upCon.clientCon);
             return;
         }
         else if(upCon.snd.empty())
