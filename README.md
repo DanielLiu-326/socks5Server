@@ -1,5 +1,5 @@
 # socks5Server
-a socks5 server base on libevent
+a socks5 server base on libevent(Linux only) 
 ## usage
 `cd src`  
 `cmake`  
