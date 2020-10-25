@@ -184,11 +184,9 @@ UpConn::UpConn(int fd, int clientCon, sockaddr_in &address) :
 
 void Connection::bufferIn(char *data, int dataLen)
 {
-    this->buffer.reserve(256);
-    for(int i = 0;i<dataLen;i++)
-    {
-        this->buffer.push_back(data[i]);
-    }
+    int nowLen = this->buffer.size();
+    this->buffer.resize(nowLen+dataLen);
+    memcpy(this->buffer.data()+nowLen,data,dataLen);
 }
 
 CONNECTION_STAT Socks5Server::connectedStatShift(Connection &con, char *recved, int length) {
