@@ -1,5 +1,5 @@
 # socks5Server
-a socks5 server base on libevent(Linux only) 
+a socks5 server based on libevent(Linux only) 
 ## usage
 `cd src`  
 `cmake`  
@@ -24,5 +24,5 @@ THREADS = 4
 danny = passwd  
 ```
 save it as server.config and move it to the directory which saved socks5Server  
-then enter: ./socks5Server the server will automatically load the properties name server.config in current work directory you can also use the path what you want just add the path after that command like  
+then enter: ./socks5Server the server will automatically load the properties named server.config in current work directory you can also use the path what you want just add the path after that command like  
 `./socks5Server <path>`
