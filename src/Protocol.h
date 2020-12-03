@@ -21,6 +21,7 @@
 #define SOCKS_CMD_CONNECT   0x01
 #define SOCKS_CMD_BIND      0x02
 #define SOCKS_CMD_UDPASS    0x03
+
 #define ADDRESS_TYPE_IPV4   0x01
 #define ADDRESS_TYPE_DOMAIN 0x03
 #define ADDRESS_TYPE_IPV6   0x04

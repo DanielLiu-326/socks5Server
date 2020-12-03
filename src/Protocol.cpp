@@ -87,6 +87,7 @@ void Protocol::parse(unsigned char* data,int dataLen,Client_CMD & rep)
             throw ParseOverflowException();
         memcpy(rep.addr.domain ,data+5,domainLen);
         rep.addr.domain [domainLen] = 0;
+        rep.port =*((int16_t*)(data+domainLen+5));
     }
 }
  void Protocol::parse(unsigned char* data,int dataLen,Rep_CMD &resp)

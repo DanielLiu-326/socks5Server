@@ -1,167 +1,99 @@
 //
-// Created by danny liu on 10/7/2020.
+// Created by danny on 11/30/2020.
 //
 
-#ifndef SOCKS5SERVER_SOCKS5SERVER_H
-#define SOCKS5SERVER_SOCKS5SERVER_H
-#include <iostream>
-#include<stdio.h>
-#include <iostream>
-#include<mutex>
-#include<queue>
-#include<unistd.h>
-#include<cstring>
-#include<mutex>
-#include<unistd.h>
-#include<sys/socket.h>
-#include<arpa/inet.h>
-#include<fcntl.h>
-#include<cassert>
-#include<thread>
-#include<sys/epoll.h>
-#include<list>
-#include<set>
+#ifndef SOCKS5_SOCKS5SERVER_H
+#define SOCKS5_SOCKS5SERVER_H
+#include<string>
 #include<map>
-#include<event2/dns.h>
-#include<event.h>   //use libevent
-#include<sys/eventfd.h>
+#include<set>
+#include<vector>
+#include<string.h>
+#include<unistd.h>
+#include<netinet/in.h>
+#include<event.h>
+#include<thread>
+#include<list>
 
+#include"ServerConfig.h"
 #include"Protocol.h"
 #include"FifoBuffer.h"
-#include"ServerUtil.h"
-#include"ServerConfigs.h"
-
-#define CON_STAT_CONNECTED      0
-#define CON_STAT_AUTH           1
-#define CON_STAT_CMD            2
-#define CON_STAT_GET_IP         3
-#define CON_STAT_CONNECTING     4
-#define CON_STAT_COMMUNICATING  5
-#define CON_STAT_CLOSE          -1
-
-#define UPCON_STAT_CONNECTING   0
-#define UPCON_STAT_CONNECTED    1
-
+#include"Session.h"
 #define WORKER_SIG_STOP         1
-#define WORKER_SIG_CON_NUM      2
-#define MIN_BUFFER_SIZE         512
 
-//configs;
-struct ServerErr :std::exception
+class Worker
 {
-    std::string why;
-    ServerErr(const std::string& why)
-    {
-        this -> why = why;
-    }
-    ServerErr()
-    {
-        this->why = strerror(errno);
-    }
-    const char * what() const noexcept override
-    {
-        return why.c_str();
-    }
-};
-typedef int32_t CONNECTION_STAT;
-struct Connection
-{
-    Connection(int fd,int upCon,sockaddr_in& address);
-    void bufferIn(char *data,int dataLen);
-    int                         fd;
-    int                         upCon;
-    AUTH_METHOD                 authMethod;
-    ServerUtil::FifoBuffer<100> snd;
-    sockaddr_in                 address;
-    sockaddr_in                 dst;
-    std::vector<char>           buffer;
-    event                       readEvent;
-    event                       writeEvent;
-    event                       ttlTimer;
-    CONNECTION_STAT             stat;
-};
+public:
+    friend Session;
+    explicit Worker(const ServerConfig* cfg,int listenFd);
+    ~Worker();
+    void start();
+    void interrupt();
+    void stop();    //will wait all session be closed;
+    //socket layer;
+    void static onNewCon(int fd,short events,void *self);//listen fd event
+    static void onARead(int fd,short events,void *session);//last arg means this ptr of Worker and session object
+    static void onAWrite(int fd,short events,void *session);
+    static void onBRead(int fd,short events,void *session);
+    static void onBWrite(int fd,short events,void *session);
+    static void onOuterSig(int fd,short events,void *self);
+    static void onSessionTimeOut(int fd,short events,void *session);//listen fd event
+    static void dns_cb(int errcode, evutil_addrinfo *addr, void *ptr);
 
-struct DnsReq
-{
-    explicit DnsReq(int clientFd,const Client_CMD&cmd);
-    int clientFd;
-    Client_CMD req;
-};
+    //socket layer operation;
+    void sendA(Session *session,const char * data,int length);
+    void sendB(Session *session,const char * data,int length);
+    void closeSession(Session* session);
 
-struct UpConn
-{
-    UpConn(int fd,int clientCon,sockaddr_in &address);
-    int                         fd;
-    int                         clientCon;
-    int32_t                     stat;
-    sockaddr_in                 address;
-    ServerUtil::FifoBuffer<100> snd;
-    event                       readEvent;
-    event                       writeEvent;
-};
+    void onAClose(Session* session);
+    void onBClose(Session* session);
+    void onABufferNoData(Session * session);
+    void onBBufferNoData(Session * session);
+    void onNegotiateStatShift(char * data ,int dataLen , Session* session);
 
-struct WorkerData
-{
-    event_base *                eventBase;
-    evdns_base *                evdnsBase;
-    event*                      serverSig;
-    event                       listenEv;
-    std::map<int , Connection*> connections;
-    std::map<int , UpConn*>     upcons;
-    char *                      buffer;
+    void onAuthStatShift(char *recved,int length,Session *session);
+    void onCmdStatShift(char *recved,int length,Session *session);
+    void onConnectingDstStatShift(int error,Session *session);
+    void onCommunicateStatShift(char *data,int dataLen,int direction,Session*session_); //direction 0 is a->b 1is b->a
+
+    int connectBServer(Session * session);
+
+    void addEvent(event* event,int timeoutSec);
+    AUTH_METHOD chooseAuth(std::vector<unsigned char> & methods);
+    //stat functions;
+    int stat_getSessionNum();
+
+private:
+    int stat_sessionNum;
+    int outerSignalFd;
+    event sigEvent;
+    std::set<Session *> sessions;
+    std::thread * workerThread;
+    void threadLoop();
+    int listenFd;
+    const ServerConfig* cfg;
+    char * buffer;
+    event_base* eventBase;
+    evdns_base* evdnsBase;
+    event listenEv;
+
 };
 class Socks5Server
 {
 public:
-    Socks5Server();
-    static std::map<std::string ,std::string > id_key;
-    void init(int threadN,int port,const char * ip=nullptr);
+    void setConfig(std::string path);
+    void init();
     void start();
     void stop();
-    void printConNum();
-    std::list<std::thread*> threads;
-    static thread_local WorkerData workerData;
-    static void onNewCon(int fd,short events,void *args);           //listen fd event
-    //client connection events
-    static void onClientReadEvent(int fd,short events,void *args);
-    static void onClientWriteEvent(int fd,short events,void *args);
-    static void onClientTimerEvent(int fd,short events,void *args);
-    //connection of dst server events;
-    static void onUpConReadEvent(int fd,short events,void* args);
-    static void onUpConWriteEvent(int fd,short events,void* args);
-
-    static void onNewServerSig(int fd,short events,void *args);     //event of server control;
-
-    static void closeClient(int fd);                                //close a client completely (close up connection and client connection)
-    static void closeUpServer(int fd);                              //close connection of dst server ,does nothing with client connection
-
-    static void sendToClient(int fd,const char *data,int length);   //send data to client throught fifobUffer;
-    static void sendToUpServer(int fd,const unsigned char *data,int length);//send data to dst server through fifobuffer;
-
-    static char choseAuthMethod(std::vector<unsigned char>& supported);
-    static int  connectUpServer(Connection&clientCon,sockaddr_in &address);
-
-    static CONNECTION_STAT connectedStatShift(Connection &con,char *recved,int length);
-    static CONNECTION_STAT authStatShift(Connection &con,char *recved,int length);
-    static CONNECTION_STAT cmdStatShift(Connection &con,char *recved,int length);
-    static CONNECTION_STAT communicatingStatShift(Connection &con,char *recved,int length);
-
-    static void addEvent(event *event,event_base *eventBase);
-    static int lookup_host(const char * host,DnsReq*req);
-
-    static void dns_callback(int errcode, struct evutil_addrinfo *addr, void *ptr);
-    static void resetClientTTL(int fd,int32_t time);
+    std::vector<int> getSessionLoad();// get connection numbers;
+    int getOnlineWorkerNum();
 
 private:
-    void            threadLoop(int evfd);
-    std::list<int>  evfds;
-    static void     workerInit(int evfd,int listenfd);
-    static void     workerLoopExit();
-    static void     workerExitClean();
-    sockaddr_in     address;
-    int             listenFd;
-    int             threadN;
+    int listenFd;
+    std::list<Worker*> workers;
+    std::string configPath;
+    ServerConfig cfg;
 };
 
 
-#endif //SOCKS5SERVER_SOCKS5SERVER_H
+#endif //SOCKS5_SOCKS5SERVER_H

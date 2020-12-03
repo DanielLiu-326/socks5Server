@@ -1,26 +1,41 @@
 //
-// Created by aptx4 on 10/7/2020.
+// Created by danny on 11/30/2020.
 //
 
 #include "Socks5Server.h"
-thread_local WorkerData Socks5Server::workerData;
-std::map<std::string ,std::string > Socks5Server::id_key;
-Socks5Server::Socks5Server()
-{
 
+#include<signal.h>
+#include<sys/socket.h>
+#include<arpa/inet.h>
+#include<fcntl.h>
+#include<evdns.h>
+//#include<iostream> // for debug
+#include<sys/eventfd.h>
+
+#include"ServerUtil.h"
+#include"config_parser/ConfigParser.h"
+#include"Protocol.h"
+
+
+void Socks5Server::setConfig(std::string path)
+{
+    this->configPath = path;
 
 }
-void Socks5Server::init(int threadN, int port, const char *ip)
+
+void Socks5Server::init()
 {
-    this->threadN = threadN;
+    ServerUtil::BlockSigno(SIGPIPE);
+    this->cfg.readConfig(this->configPath);
     this->listenFd = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
     if(this->listenFd<0)
     {
         throw ServerErr();
     }
-    address.sin_port = htons(port);
+    sockaddr_in address;
+    address.sin_port = htons(cfg.PORT);
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = ip?inet_addr(ip):INADDR_ANY;
+    address.sin_addr.s_addr = inet_addr(cfg.SERVER_IP.c_str());
     if(bind(listenFd,(sockaddr*)&address,sizeof(address))<0)
     {
         close(listenFd);
@@ -36,194 +51,316 @@ void Socks5Server::init(int threadN, int port, const char *ip)
         close(listenFd);
         throw ServerErr();
     }
-
-
+    for(int i = 0;i<this->cfg.THREADS;i++)
+    {
+        this->workers.push_back(new Worker(&this->cfg,this->listenFd));
+    }
 }
 
 void Socks5Server::start()
 {
-    std::cout<<"initing..."<<std::endl;
-    std::cout<<"starting "<<this->threadN<<" threads"<<std::endl;
-    std::cout<<"ip   : "<<inet_ntoa(this->address.sin_addr)<<std::endl;
-    std::cout<<"port : "<<ntohs(this->address.sin_port)<<std::endl;
-    for(int i = 0;i<this->threadN;i++)
+    for(auto x: this->workers)
     {
-        int evfd = eventfd(0,EFD_NONBLOCK);
-        if(evfd<0)
-            throw ServerErr();
-        this->evfds.push_back(evfd);
-        this->threads.push_back(new std::thread(&Socks5Server::threadLoop,this,evfd));
-        usleep(200*1000);
+        x->start();
     }
+
 }
 
-void Socks5Server::threadLoop(int evfd)
+void Socks5Server::stop()
 {
-    //all resources store in thread_local struct variable
-    // allocate resources needed in event loop
-    workerInit(evfd,this->listenFd);
-    //event loop start;
-    std::cout<<"worker thread : "<<"loop started"<<std::endl;
-    event_base_dispatch(workerData.eventBase);
-    //clean allocated resources;
-    workerExitClean();
+    for(auto &x : this->workers)
+    {
+        x->interrupt();
+        delete x;
+    }
+    workers.clear();
+
 }
 
-void Socks5Server::onNewCon(int fd, short events, void *args)
+std::vector<int> Socks5Server::getSessionLoad() {
+    std::vector<int> ret;
+    for(auto x : this->workers)
+    {
+        ret.push_back(x->stat_getSessionNum());
+    }
+    return ret;
+}
+
+int Socks5Server::getOnlineWorkerNum()
 {
+    return this->workers.size();
+}
+
+Worker::Worker(const ServerConfig *cfg, int listenFd):listenFd(listenFd),cfg(cfg),stat_sessionNum(0)
+{
+    buffer = new char[cfg->SEND_UNIT_SIZE + 10];
+    eventBase = event_init();
+    evdnsBase = evdns_base_new(eventBase,1);
+
+    event_set(&listenEv,listenFd,EV_READ|EV_PERSIST,onNewCon,this);
+    event_base_set(eventBase,&listenEv);
+    event_add(&listenEv,NULL);
+
+    this->outerSignalFd = eventfd(0,EFD_NONBLOCK);
+    if(outerSignalFd<0)
+        throw ServerErr();
+    event_set(&this->sigEvent,this->outerSignalFd,EV_PERSIST|EV_READ,Worker::onOuterSig,this);
+    event_base_set(this->eventBase,&this->sigEvent);
+    event_add(&this->sigEvent,NULL);
+}
+
+void Worker::start()
+{
+    this->workerThread = new std::thread(&Worker::threadLoop,this);
+}
+
+void Worker::threadLoop()
+{
+    event_base_dispatch(this->eventBase);
+}
+
+void Worker::onNewCon(int fd, short events, void *_self)
+{
+    Worker * self = (Worker*)_self;
     sockaddr_in address;
-    socklen_t sockLen = sizeof(address);
-    int newfd = accept(fd,(sockaddr*)&address,&sockLen);
-    if(newfd<0)
+    socklen_t len = sizeof(address);
+    int newFd=accept(fd,(sockaddr*)&address,&len);
+    if(newFd<0)
     {
         if(errno==EAGAIN)
         {
             return;
         }
-        else
-        {
-            //todo: errors occurred
-        }
+        //todo :error accept new fd <0;
+        return;
     }
+    Session* session = new Session(newFd,self);
+    self->addEvent(&session->aRead,NULL);
+    self->addEvent(&session->timer,self->cfg->CLIENT_TTL);
+    self->sessions.insert(session);
+    session->resetTimer(self->cfg->CLIENT_TTL);
+    //statistic refresh;
+    self->stat_sessionNum++;
+}
+
+void Worker::addEvent(event *event,int timeoutSec)
+{
+    timeval time;
+    time.tv_sec = timeoutSec;
+    if(timeoutSec)
+        event_add(event,&time);
     else
-    {
-        auto newCon = new Connection(newfd,NULL,address);
-        workerData.connections[newfd] = newCon;
-        addEvent(&newCon->readEvent,workerData.eventBase);
-        resetClientTTL(newfd,CLIENT_TTL);
-    }
+        event_add(event,NULL);
+
 }
 
-
-
-Connection::Connection(int fd, int upCon, sockaddr_in &address):
-fd(fd),upCon(upCon),address(address),stat(CON_STAT_CONNECTED)
+void Worker::onARead(int fd, short events, void *session_)
 {
-    event_set(&this->readEvent,fd,EV_READ,Socks5Server::onClientReadEvent,this);
-    event_set(&this->writeEvent,fd,EV_WRITE,Socks5Server::onClientWriteEvent,this);
-    evtimer_set(&this->ttlTimer,Socks5Server::onClientTimerEvent,this);
-}
-
-void Socks5Server::onClientReadEvent(int fd, short events, void *args)
-{
-    char *buffer = workerData.buffer;
-    auto conData = ((Connection*)args);
-    int readLen = read(fd,buffer,SEND_UNIT_SIZE);
+    Session * session = (Session*)session_;
+    const ServerConfig* cfg = session->worker->cfg;
+    Worker * worker = session->worker;
+    char *buffer = worker->buffer;
+    errno = 0;
+    int readLen = read(fd,buffer,cfg->SEND_UNIT_SIZE);
     if(readLen<=0&&errno!=EAGAIN)
     {
         //error or disconnected;
-        closeClient(fd);
+        worker->onAClose(session);
         return;
     }else if(errno==EAGAIN)
     {
-        addEvent(&conData->readEvent,workerData.eventBase);
-    }
-    resetClientTTL(fd,CLIENT_TTL);
-    if(conData->stat==CON_STAT_CONNECTED)
-    {
-        conData->stat = connectedStatShift(*conData,buffer,readLen);
-        addEvent(&conData->readEvent,workerData.eventBase);
-
-    }
-    else if(conData->stat == CON_STAT_AUTH)
-    {
-        conData->stat = authStatShift(*conData,buffer,readLen);
-        addEvent(&conData->readEvent,workerData.eventBase);
-    }
-    else if(conData->stat == CON_STAT_CMD)
-    {
-        conData->stat = cmdStatShift(*conData,buffer,readLen);
-        addEvent(&conData->readEvent,workerData.eventBase);
-    }
-    else if(conData->stat == CON_STAT_GET_IP)
-    {
-        addEvent(&conData->readEvent,workerData.eventBase);
-    }
-    else if(conData->stat == CON_STAT_CONNECTING)
-    {
-        addEvent(&conData->readEvent,workerData.eventBase);
+        worker->addEvent(&session->aRead,NULL);
         return;
     }
-    else if(conData->stat==CON_STAT_COMMUNICATING)
+    session->resetTimer(worker->cfg->CLIENT_TTL);
+    switch (session->stat)
     {
-        conData->stat = communicatingStatShift(*conData,buffer,readLen);
-    }
-
-    if(conData->stat==CON_STAT_CLOSE)
-    {
-        closeClient(fd);
+        case ConStat::NEGOTIATE:
+            worker->onNegotiateStatShift(buffer,readLen,session);
+            break;
+        case ConStat::AUTH:
+            worker->onAuthStatShift(buffer,readLen,session);
+            break;
+        case ConStat::CMD:
+            worker->onCmdStatShift(buffer,readLen,session);
+            break;
+        case ConStat::COMMUNICATE:
+            worker->onCommunicateStatShift(buffer,readLen,0,session);
+            break;
     }
 }
 
-void Socks5Server::closeClient(int fd)
+void Worker::onAWrite(int fd, short events, void *session_)
 {
-    close(fd);
-    auto conData = workerData.connections[fd];
-    workerData.connections.erase(fd);
-    if(conData->stat>CON_STAT_GET_IP||(conData->upCon&&workerData.upcons.count(conData->upCon)))
+    Session * session = (Session*)session_;
+    Worker *worker = session->worker;
+    const ServerConfig *cfg = worker->cfg;
+    int sendLen = session->a_buffer.writeOut(fd,cfg->SEND_UNIT_SIZE);
+    if(sendLen<0)
     {
-        close(conData->upCon);
-        auto upConData = workerData.upcons[conData->upCon];
-        workerData.upcons.erase(conData->upCon);
-        event_del(&upConData->readEvent);
-        event_del(&upConData->writeEvent);
-        delete upConData;
+        //error
+        worker->onAClose(session);
     }
-    event_del(&conData->readEvent);
-    event_del(&conData->writeEvent);
-    event_del(&conData->ttlTimer);
-    delete conData;
+    else if(session->a_buffer.empty())
+    {
+        //no data to be send;
+        worker->onABufferNoData(session);
+        return;
+    }else if(errno == EAGAIN)
+    {
+        worker->addEvent(&session->aWrite,NULL);
+    }
 }
 
-UpConn::UpConn(int fd, int clientCon, sockaddr_in &address) :
-        fd(fd),clientCon(clientCon),address(address),stat(UPCON_STAT_CONNECTING) {
-    event_set(&this->readEvent, fd, EV_READ, Socks5Server::onUpConReadEvent, this);
-    event_set(&this->writeEvent, fd, EV_WRITE, Socks5Server::onUpConWriteEvent, this);
-}
-
-
-void Connection::bufferIn(char *data, int dataLen)
+void Worker::onBRead(int fd, short events, void *session_)
 {
-    int nowLen = this->buffer.size();
-    this->buffer.resize(nowLen+dataLen);
-    memcpy(this->buffer.data()+nowLen,data,dataLen);
+    Session * session = (Session*)session_;
+    const ServerConfig* cfg = session->worker->cfg;
+    Worker * worker = session->worker;
+    char *buffer = worker->buffer;
+    errno = 0;
+    int readLen = read(fd,buffer,cfg->SEND_UNIT_SIZE);
+    if(readLen<=0&&errno!=EAGAIN)
+    {
+        //error or disconnected;
+        worker->onBClose(session);
+        return;
+    }else if(errno==EAGAIN)
+    {
+        worker->addEvent(&session->bRead,NULL);
+        return;
+    }
+    session->resetTimer(cfg->CLIENT_TTL);
+    worker->onCommunicateStatShift(buffer,readLen,1,session);
 }
 
-CONNECTION_STAT Socks5Server::connectedStatShift(Connection &con, char *recved, int length) {
-    con.bufferIn(recved,length);
-    AuthGetRequest request;
-    try {
-        Protocol::parse((unsigned char *)con.buffer.data(),con.buffer.size(),request);
-    } catch (...) {
-        return con.stat;
-    }
-    if(request.version!=0x05)
+void Worker::onBWrite(int fd, short events, void *session_)
+{
+    Session *session = (Session * ) session_;
+    Worker *worker = session->worker;
+    const ServerConfig* cfg = worker->cfg;
+    if(session->stat == ConStat::CONNECTING_DST)
     {
-        return CON_STAT_CLOSE;
-    }
-    auto authMethod = choseAuthMethod(request.methods);
-    AuthGetReply reply;
-    reply.version = 0x05;
-    reply.authMethod = authMethod;
-    unsigned char sndBuffer[50];
-    int sndLen = Protocol::build(sndBuffer,sizeof(sndBuffer),reply);
-    sendToClient(con.fd,(char*)sndBuffer,sndLen);
-    con.buffer.clear();
-    con.authMethod = reply.authMethod;
-    if(con.authMethod == AUTH_NONE)
-    {
-        return CON_STAT_CMD;
+        //check if connection is ready;
+        int32_t error = 0;
+        socklen_t errorLen = sizeof(error);
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&error, &errorLen) < 0)
+        {
+            error = 1;
+        }
+        worker->onConnectingDstStatShift(error?CMD_RESPONSE_TARGET_REFUSED:CMD_RESPONSE_OK,session);
     }
     else
     {
-        return CON_STAT_AUTH;
+        int sendLen = session->b_buffer.writeOut(fd,cfg->SEND_UNIT_SIZE);
+        if(sendLen<0)
+        {
+            //error
+            worker->onBClose(session);
+        }
+        else if(session->b_buffer.empty())
+        {
+            //no data to be send;
+            worker->onBBufferNoData(session);
+            return;
+        }else if(errno == EAGAIN)
+        {
+            worker->addEvent(&session->bWrite,NULL);
+        }
+
     }
 }
 
-char Socks5Server::choseAuthMethod(std::vector<unsigned char>& supported) {
-    for(auto x:supported)
+void Worker::onSessionTimeOut(int fd, short events, void *session_ )
+{
+    Session *session =(Session*) session_;
+    session->worker->closeSession(session);
+}
+
+void Worker::stop()
+{
+    event_del(&this->listenEv);
+}
+
+
+void Worker::dns_cb(int errcode, addrinfo *addr, void *ptr)
+{
+    if(errcode ==EVUTIL_EAI_CANCEL)// dns request was canceled by closeSession() so ptr is invalid
     {
-        if(x == AUTH_NONE&&ALLOW_ANONYMOUSE)
+        return;
+    }
+    Session *session = (Session*)ptr;
+    Worker *worker = session->worker;
+    session->dnsReq = nullptr;
+    if (errcode)
+    {
+        //todo : resolve error
+        worker->onConnectingDstStatShift(CMD_RESPONSE_TARGET_INVALID,session);
+        return;
+    }
+    else
+    {
+        struct evutil_addrinfo *ai = addr;
+        if (ai->ai_family == AF_INET)
+        {
+            sockaddr_in addr  = *(struct sockaddr_in *) ai->ai_addr;
+            addr.sin_port = session->cmd.port;
+            addr.sin_family = AF_INET;
+            int conRes = ::connect(session->b_id,(sockaddr*)&addr,sizeof(sockaddr_in));
+            if(conRes<0&&errno!=EINPROGRESS)
+            {
+                //error occurred
+                worker->onConnectingDstStatShift(CMD_RESPONSE_TARGET_REFUSED,session);
+            }
+            else
+            {
+                event_set(&session->bWrite,session->b_id,EV_WRITE,onBWrite,session);
+                worker->addEvent(&session->bWrite,NULL);
+            }
+        }
+        else
+        {
+            //error
+            worker->onConnectingDstStatShift(CMD_RESPONSE_TGT_NOTSPT,session);
+        }
+        evutil_freeaddrinfo(addr);
+    }
+}
+
+void Worker::onNegotiateStatShift(char *data, int dataLen, Session *session) {
+    session->bufferIn(data,dataLen);
+    AuthGetRequest request;
+    try
+    {
+        Protocol::parse((unsigned char *)session->protoBuffer.data(),session->protoBuffer.size(),request);
+    } catch (...)
+    {
+        return;
+    }
+    session->protoBuffer.clear();
+    addEvent(&session->aRead,NULL);
+    if(request.version==0x05)
+    {
+        AuthGetReply authGetReply;
+        authGetReply.version = 0x05;
+        authGetReply.authMethod = chooseAuth(request.methods);
+        session->authMethod = authGetReply.authMethod;
+        int len = Protocol::build((unsigned char*)this->buffer,this->cfg->SEND_UNIT_SIZE,authGetReply);
+        sendA(session,this->buffer,len);
+        session->stat = (session->authMethod == AUTH_NONE? ConStat::CMD:ConStat::AUTH );
+    }
+    else
+    {
+        //version wrong
+
+    }
+}
+
+AUTH_METHOD Worker::chooseAuth(std::vector<unsigned char> &methods)
+{
+    for(auto x:methods)
+    {
+        if(x == AUTH_NONE&&this->cfg->ALLOW_ANONYMOUSE)
         {
             return AUTH_NONE;
         }
@@ -235,465 +372,313 @@ char Socks5Server::choseAuthMethod(std::vector<unsigned char>& supported) {
     return AUTH_NONE;
 }
 
-
-void Socks5Server::sendToClient(int fd, const char *data, int length)
+void Worker::sendA(Session *session, const char *data, int length)
 {
-    auto con = workerData.connections[fd];
-    con->snd.writeIn((const char *)data,length);
-    addEvent(&con->writeEvent,workerData.eventBase);
+    session->a_buffer.writeIn(data,length);
+    addEvent(&session->aWrite,NULL);
 }
 
-void Socks5Server::sendToUpServer(int fd, const unsigned char *data, int length)
-{
-    auto con = workerData.upcons[fd];
-    con->snd.writeIn((const char *)data,length);
-    addEvent(&con->writeEvent,workerData.eventBase);
-}
 
-CONNECTION_STAT Socks5Server::authStatShift(Connection &con, char *recved, int length) {
-    con.bufferIn(recved,length);
+void Worker::onAuthStatShift( char *recved, int length,Session *session)
+{
+    Worker *worker = session->worker;
+    session->bufferIn(recved,length);
     Auth_Id_Key_Req req;
     try {
-        Protocol::parse((unsigned char*)con.buffer.data(),con.buffer.size(),req);
+        Protocol::parse((unsigned char*)recved,length,req);
     }
     catch (...)
     {
-        return con.stat;
+        return;
     }
+    session->protoBuffer.clear();
+    addEvent(&session->aRead,NULL);
+
     Auth_Id_Key_Rep rep;
-    if(con.authMethod==AUTH_ID_KEY)
+    if(session->authMethod==AUTH_ID_KEY)
     {
         rep.version = 0x05;
         rep.authResult = AUTH_RESULT_OK;
         try {
-            if(id_key.at(req.name) != req.passwd)
+            if(worker->cfg->id_key.at(req.name) != req.passwd)
             {
                 throw std::exception();
             }
         } catch (...) {
             rep.authResult = AUTH_RESULT_ERR;
         }
-        char sndBuffer[10];
-        int sndLen = Protocol::build((unsigned char*)sndBuffer,sizeof(sndBuffer),rep);
-        con.buffer.clear();
-        sendToClient(con.fd,sndBuffer,sndLen);
-        con.buffer.clear();
-        return rep.authResult==AUTH_RESULT_OK?CON_STAT_CMD:con.stat;
+        int sendLen = Protocol::build((unsigned char*)worker->buffer,worker->cfg->SEND_UNIT_SIZE,rep);
+        sendA(session,worker->buffer,sendLen);
+        session->stat = (rep.authResult==AUTH_RESULT_OK?ConStat::CMD :session->stat);
+
     }
     else
     {
-
+        //todo : not support yet;
     }
-
 }
 
-CONNECTION_STAT Socks5Server::cmdStatShift(Connection &con, char *recved, int length) {
-    con.bufferIn(recved,length);
+void Worker::onCmdStatShift(char *recved, int length, Session *session)
+{
+    session->bufferIn(recved,length);
+    Worker *worker = session->worker;
     Client_CMD req;
-    try {
-        Protocol::parse((unsigned char*)con.buffer.data(),con.buffer.size(),req);
-    } catch (...) {
-        return con.stat;
+    try
+    {
+        Protocol::parse((unsigned char*)session->protoBuffer.data(),session->protoBuffer.size(),req);
     }
-    con.buffer.clear();
+    catch (...)
+    {
+        return ;
+    }
+    session->protoBuffer.clear();
     if(req.version!=0x05)
     {
-        return CON_STAT_CLOSE;
+        //error version wrong
+        session->stat = ConStat::WAIT;
+        Rep_CMD rep(0x05,CMD_RESPONSE_NOT_SUPPORTED,0x00,0x00,{},0x00);
+        int sendLen = Protocol::build((unsigned char*)worker->buffer,worker->cfg->SEND_UNIT_SIZE,rep);
+        sendA(session,worker->buffer,sendLen);
+        return;
     }
+    session->cmd = req;
     if(req.cmd==SOCKS_CMD_CONNECT)
     {
-        if(req.addr_type==ADDRESS_TYPE_IPV4)
-        {
-            con.dst.sin_family =AF_INET;
-            con.dst.sin_port = req.port;
-            con.dst.sin_addr.s_addr = req.addr.ipv4addr;
-            int res = connectUpServer(con,con.dst);
-            if(res<0)
-            {
-                char sndBuffer[50];
-                Rep_CMD rep;
-                rep.version = 0x05;
-                rep.response = CMD_RESPONSE_NETWORK_ERR;
-                rep.addr_type = ADDRESS_TYPE_IPV4;
-                rep.rsv = 0x00;
-                int sndLen = Protocol::build((unsigned char*)sndBuffer,sizeof(sndBuffer),rep);
-                sendToClient(con.fd,sndBuffer,sndLen);
-                return CON_STAT_CMD;
-            }
-            else
-                return CON_STAT_CONNECTING;
-        }
-        else if(req.addr_type==ADDRESS_TYPE_DOMAIN)
-        {
-            lookup_host(req.addr.domain,new DnsReq(con.fd,req));
-            return CON_STAT_GET_IP;
-        }else if(req.addr_type==ADDRESS_TYPE_IPV6)
-        {
-            //not supported now;
-            char sndBuffer[50];
-            Rep_CMD rep(0x05,CMD_RESPONSE_TGT_NOTSPT,0x00,0x00,{},0x00);
-            int sndLen = Protocol::build((unsigned char*)sndBuffer,sizeof(sndBuffer),rep);
-            sendToClient(con.fd,sndBuffer,sndLen);
-            return CON_STAT_CMD;
-        }
+        connectBServer(session);
     }
     else
     {
-        char sndBuffer[50];
         Rep_CMD rep(0x05,CMD_RESPONSE_NOT_SUPPORTED,0x00,0x00,{},0x00);
-        int sndLen = Protocol::build((unsigned char*)sndBuffer,sizeof(sndBuffer),rep);
-        sendToClient(con.fd,sndBuffer,sndLen);
-        return CON_STAT_CMD;
+        int sendLen = Protocol::build((unsigned char*)worker->buffer,worker->cfg->SEND_UNIT_SIZE,rep);
+        sendA(session,worker->buffer,sendLen);
+        return;
     }
+
 }
 
-int Socks5Server::connectUpServer(Connection&clientCon,sockaddr_in &address)
+void Worker::onConnectingDstStatShift(int response, Session *session)
 {
-    int ret = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
-    if(ret < 0)
+    Rep_CMD repCmd(0x05,response,0x00,ADDRESS_TYPE_IPV4,{},12345);
+    if(response==CMD_RESPONSE_OK)
     {
-        return ret;
-    }
-    ServerUtil::setNonblock(ret);
-    int conRes = connect(ret,(sockaddr*)&address,sizeof(address));
-    if(conRes==0||(conRes<0&&errno==EINPROGRESS))
-    {
-        auto newUp = new UpConn(ret,clientCon.fd,address);
-        newUp->stat = UPCON_STAT_CONNECTING;
-        clientCon.upCon = ret;
-        addEvent(&newUp->writeEvent,workerData.eventBase);
-        workerData.upcons[ret] = newUp;
-        return ret;
+        //connected;
+        addEvent(&session->bRead,NULL);
+        addEvent(&session->aRead,NULL);
+        session->stat = ConStat::COMMUNICATE;
     }
     else
     {
-        //error
-        close(ret);
-        return -1;
+        //error occurred;
+        session->stat = ConStat::WAIT;
     }
-}
 
-void Socks5Server::onClientWriteEvent(int fd, short events, void *args)
-{
-    auto &con = *((Connection*)args);
-    errno = 0;
-    int sndLen = con.snd.writeOut(fd,SEND_UNIT_SIZE);
-    if(sndLen<0)
-    {
-        closeClient(fd);
-    }
-    else if(con.snd.empty())
-    {
-        if(con.stat>=CON_STAT_COMMUNICATING)
-        {
-            addEvent(&workerData.upcons[con.upCon]->readEvent, workerData.eventBase);
-        }
-    }else if(errno == EAGAIN)
-    {
-        addEvent(&con.writeEvent,workerData.eventBase);
-    }
+    int sendLen = Protocol::build((unsigned char *)this->buffer,cfg->SEND_UNIT_SIZE,repCmd);
+    this->sendA(session,this->buffer,sendLen);
 
 }
 
-void Socks5Server::onUpConReadEvent(int fd, short events, void *args)
+void Worker::onCommunicateStatShift(char *data, int dataLen, int direction, Session *session_)
 {
-    auto &upCon = *((UpConn*)args);
-    char* buffer = workerData.buffer;
-    int readLen = read(fd,buffer,SEND_UNIT_SIZE);
-    resetClientTTL(upCon.clientCon,CLIENT_TTL);
-    if(readLen<=0&&errno!=EAGAIN)
+    Session *session = (Session*)session_;
+    Worker* worker = session->worker;
+    if(direction)
     {
-        //error or disconnected;
-        closeClient(upCon.clientCon);
-        return;
-    }
-    else if(errno==EAGAIN)
-    {
-        addEvent(&upCon.readEvent,workerData.eventBase);
-    }else
-    {
-        sendToClient(upCon.clientCon,buffer,readLen);
-        return;
-
-    }
-
-}
-
-void Socks5Server::addEvent(event *event, event_base *eventBase)
-{
-    event_base_set(eventBase,event);
-    event_add(event,NULL);
-}
-
-void Socks5Server::onUpConWriteEvent(int fd, short events, void *args)
-{
-    char *buffer = workerData.buffer;
-    auto &upCon = *((UpConn*)args);
-    if(upCon.stat==UPCON_STAT_CONNECTING)
-    {
-        //check if connection is ready;
-        int32_t error = 0;
-        socklen_t errorLen = sizeof(error);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&error, &errorLen) < 0)
-        {
-            error = 1;
-        }
-        Rep_CMD repCmd;
-        repCmd.addr_type=ADDRESS_TYPE_IPV4;
-        repCmd.addr.ipv4addr = htonl(INADDR_ANY);
-        repCmd.port = htons(12345);
-        repCmd.rsv = 0x00;
-        repCmd.version = 0x05;
-        if(error==0)
-        {
-            //connected;
-            repCmd.response = CMD_RESPONSE_OK ;
-            int sndLen = Protocol::build((unsigned char *)buffer,SEND_UNIT_SIZE,repCmd);
-            sendToClient(upCon.clientCon,buffer,sndLen);
-            addEvent(&upCon.readEvent,workerData.eventBase);
-            upCon.stat = UPCON_STAT_CONNECTED;
-            workerData.connections[upCon.clientCon]->stat = CON_STAT_COMMUNICATING;
-        }
-        else
-        {
-            //error occurred;
-            repCmd.response = CMD_RESPONSE_TARGET_INVALID;
-            int sndLen = Protocol::build((unsigned char *)buffer,SEND_UNIT_SIZE,repCmd);
-            sendToClient(upCon.clientCon,buffer,sndLen);
-            workerData.connections[upCon.clientCon]->stat = CON_STAT_CMD;
-        }
+        //B->A
+        sendA(session,data,dataLen);
     }
     else
     {
-        //communicate;
-        int sndLen = upCon.snd.writeOut(fd,SEND_UNIT_SIZE);
-        if(sndLen<0)
-        {
-            //error occurred;
-            closeClient(upCon.clientCon);
-            return;
-        }
-        else if(upCon.snd.empty())
-        {
-            //no more data to send;
-            addEvent(&workerData.connections[upCon.clientCon]->readEvent,workerData.eventBase);
-            return;
-        }
-        else
-        {
-            //eagain(buffer full);
-            addEvent(&upCon.writeEvent,workerData.eventBase);
-        }
+        //A->B
+        sendB(session,data,dataLen);
     }
 }
 
-CONNECTION_STAT Socks5Server::communicatingStatShift(Connection &con, char *recved, int length)
+void Worker::sendB(Session *session, const char *data, int length)
 {
-    sendToUpServer(con.upCon,(unsigned char*)recved,length);
-    return con.stat;
+    session->b_buffer.writeIn(data,length);
+    addEvent(&session->bWrite,NULL);
 }
 
-void Socks5Server::closeUpServer(int fd)
+void Worker::onABufferNoData(Session *session)
 {
-    if(!workerData.upcons.count(fd))
-        return;
-    close(fd);
-    auto upCon = workerData.upcons[fd];
-    event_del(&upCon->writeEvent);
-    event_del(&upCon->readEvent);
-    auto con = workerData.connections[upCon->clientCon];
-    con->upCon = NULL;
-    delete upCon;
-    workerData.upcons.erase(fd);
-    return;
-}
-
-int Socks5Server::lookup_host(const char *host,DnsReq*context)
-{
-    struct evutil_addrinfo hints;
-    struct evdns_getaddrinfo_request *req;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_flags = EVUTIL_AI_CANONNAME;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-
-    req = evdns_getaddrinfo(workerData.evdnsBase, host,NULL,&hints, dns_callback, (void*)context);
-    if (req == NULL)
+    if(session->stat==ConStat::COMMUNICATE)
     {
+        addEvent(&session->bRead,NULL);
+    }
+    if(session->stat==ConStat::WAIT&&session->b_buffer.empty())
+    {
+        closeSession(session);
+    }
+}
+
+void Worker::onBBufferNoData(Session *session)
+{
+
+    if(session->stat==ConStat::COMMUNICATE)
+    {
+        addEvent(&session->aRead,NULL);
+    }
+    if(session->stat==ConStat::WAIT&&session->a_buffer.empty())
+    {
+        closeSession(session);
+    }
+}
+
+void Worker::closeSession(Session *session)
+{
+    event_del(&session->aRead);
+    event_del(&session->aWrite);
+    event_del(&session->timer);
+    if(session->b_id>=0)
+    {
+        event_del(&session->bWrite);
+        event_del(&session->bRead);
+    }
+    session->close();
+    if(session->dnsReq)
+    {
+        evdns_getaddrinfo_cancel(session->dnsReq);
+    }
+    delete session;
+    this->sessions.erase(session);
+    this->stat_sessionNum --;
+}
+
+int Worker::connectBServer( Session *session)
+{
+    auto& req = session->cmd;
+    int newFd = socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
+    session->assignB(newFd);
+    if(session->b_id < 0)
+    {
+        onConnectingDstStatShift(CMD_RESPONSE_TARGET_INVALID,session);
         return -1;
     }
+    ServerUtil::setNonblock(session->b_id);
+    switch (req.addr_type)
+    {
+        case ADDRESS_TYPE_IPV4:
+         {
+            sockaddr_in addr;
+            addr.sin_addr.s_addr = req.addr.ipv4addr;
+            addr.sin_port = req.port;
+            addr.sin_family = AF_INET;
+            session->stat = ConStat::CONNECTING_DST;
+            int conRes = ::connect(session->b_id, (sockaddr *) &session->cmd.addr, sizeof(sockaddr_in));
+            if (conRes == 0 || (conRes < 0 && errno == EINPROGRESS))
+            {
+                //connecting
+                addEvent(&session->bWrite, NULL);
+            } else {
+                onConnectingDstStatShift(CMD_RESPONSE_TARGET_INVALID,session);
+            }
+        }break;
+        case ADDRESS_TYPE_DOMAIN:
+        {
+            struct evutil_addrinfo hints;
+            struct evdns_getaddrinfo_request *dns_req;
+            memset(&hints, 0, sizeof(hints));
+            hints.ai_family = AF_INET;
+            hints.ai_flags = EVUTIL_AI_CANONNAME;
+            hints.ai_socktype = SOCK_STREAM;
+            hints.ai_protocol = IPPROTO_TCP;
+            dns_req = evdns_getaddrinfo(evdnsBase,session->cmd.addr.domain,NULL,&hints, dns_cb,session);
+            session->dnsReq = dns_req;
+            if (dns_req == NULL)
+            {
+                onConnectingDstStatShift(CMD_RESPONSE_TARGET_INVALID,session);
+                return -1;
+            }
+            session->stat = ConStat::CONNECTING_DST;
+            break;
+        }
+        case ADDRESS_TYPE_IPV6:
+            //not support yet;
+            onConnectingDstStatShift(CMD_RESPONSE_TGT_NOTSPT,session);
+            break;
+    }
+
     return 0;
 }
 
-void Socks5Server::dns_callback(int errcode, struct addrinfo *addr, void *ptr) {
-    DnsReq *context = (DnsReq *) ptr;
-    if (!workerData.connections.count(context->clientFd) ||
-        workerData.connections[context->clientFd]->stat != CON_STAT_GET_IP)
+void Worker::onAClose(Session *session)
+{
+    if(session->stat == ConStat::WAIT)
     {
-        if (addr)evutil_freeaddrinfo(addr);
-        return;
-    }
-    auto &con = *workerData.connections[context->clientFd];
-    if (errcode)
-    {
-        char sndBuffer[50];
-        Rep_CMD rep(0x05,CMD_RESPONSE_TARGET_INVALID,ADDRESS_TYPE_IPV4,0,{},0x00);
-        int sndLen = Protocol::build((unsigned char *) sndBuffer, sizeof(sndBuffer), rep);
-        sendToClient(con.fd, sndBuffer, sndLen);
-        con.stat =CON_STAT_CMD;
-        return;
+        closeSession(session);
     }
     else
     {
-        struct evutil_addrinfo *ai = addr;
-        if (ai->ai_family == AF_INET)
-        {
-            struct sockaddr_in *sin = (struct sockaddr_in *) ai->ai_addr;
-            sin->sin_addr;
-            context->req.port;
-            int res = connectUpServer(con,con.dst);
-            if(res<0)
-            {
-                char sndBuffer[500];
-                Rep_CMD rep(0x05,CMD_RESPONSE_NETWORK_ERR,0,ADDRESS_TYPE_IPV4,{},1234);
-                int sndLen = Protocol::build((unsigned char*)sndBuffer,sizeof(sndBuffer),rep);
-                sendToClient(con.fd,sndBuffer,sndLen);
-                con.stat = CON_STAT_CMD;
-            }
-            else
-            {
-                con.stat= CON_STAT_CONNECTING;
-
-            }
-        }
-        else if (ai->ai_family == AF_INET6)
-        {
-            sockaddr_in6 addr;
-            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *) ai->ai_addr;
-            sin6->sin6_addr;
-            return ;
-        }
-        if (addr)evutil_freeaddrinfo(addr);
+        session->stat = ConStat::WAIT;
     }
 }
 
-void Socks5Server::workerLoopExit()
+void Worker::onBClose(Session *session)
 {
-    event_base_loopexit(workerData.eventBase,NULL);
-
-}
-
-void Socks5Server::workerExitClean()
-{
-    event_base_free(workerData.eventBase);
-    evdns_base_free(workerData.evdnsBase,NULL);
-    for(auto & connection : workerData.connections)
+    if(session->stat == ConStat::WAIT)
     {
-        close(connection.first);
-        delete connection.second;
+        closeSession(session);
     }
-    workerData.connections.clear();
-    for(auto & upcon : workerData.upcons)
-    {
-        close(upcon.first);
-        delete upcon.second;
-    }
-    event_free(workerData.serverSig);
-    delete [] workerData.buffer;
-    return;
-}
-
-void Socks5Server::stop()
-{
-    std::cout<<"stopping..."<<std::endl;
-    for(auto x:this->evfds)
-    {
-        eventfd_write(x,WORKER_SIG_STOP);
-    }
-    std::cout<<"quiting "<<this->threadN<<" threads"<<std::endl;
-    int i = 0;
-    for(auto x:this->threads)
-    {
-        x->join();
-        delete x;
-        std::cout<<"quited "<<i++<<std::endl;
-    }
-    for(auto x:this->evfds)
-    {
-        close(x);
-    }
-    this->evfds.clear();
-    this->threads.clear();
-    std::cout<<"quit correctly!"<<std::endl;
-}
-
-void Socks5Server::onNewServerSig(int fd, short events, void *args)
-{
-    eventfd_t value = 0;
-    int res = eventfd_read(fd,&value);
-    if(res<0&&errno==EAGAIN)
-        return;
-    switch (value)
-    {
-        case WORKER_SIG_STOP:
-        {
-            workerLoopExit();
-        }break;
-        case WORKER_SIG_CON_NUM:
-        {
-            std::cout<<"worker thread : client connections:"<<workerData.connections.size()<<"ready connections:"<<workerData.upcons.size()<<std::endl;
-        }break;
-        default:
-            return;
-    }
-}
-
-void Socks5Server::resetClientTTL(int fd, int32_t time)
-{
-    if(!workerData.connections.count(fd))
-        return ;
-    timeval tm{time,0};
-    auto &con = *workerData.connections[fd];
-    event_base_set(workerData.eventBase,&con.ttlTimer);
-    event_add(&con.ttlTimer,&tm);
-}
-
-void Socks5Server::onClientTimerEvent(int fd, short events, void *args)
-{
-    closeClient(((Connection*)(args))->fd);
-    return;
-}
-
-void Socks5Server::printConNum()
-{
-    for(auto x:this->evfds)
-    {
-        eventfd_write(x,WORKER_SIG_CON_NUM);
-        sleep(1);
-    }
-}
-
-void Socks5Server::workerInit(int evfd,int listenfd)
-{
-    if(SEND_UNIT_SIZE<MIN_BUFFER_SIZE)
-        workerData.buffer = new char[MIN_BUFFER_SIZE];
     else
-        workerData.buffer = new char[SEND_UNIT_SIZE + 10];
+    {
+        session->stat = ConStat::WAIT;
+    }
 
-    workerData.eventBase = event_init();
-
-    workerData.evdnsBase = evdns_base_new(workerData.eventBase,1);
-
-    event_set(&workerData.listenEv,listenfd,EV_READ|EV_PERSIST,onNewCon,NULL);
-    addEvent(&workerData.listenEv,workerData.eventBase);
-
-    workerData.serverSig = event_new(workerData.eventBase,evfd,EV_READ|EV_PERSIST,onNewServerSig,NULL);
-    event_add(workerData.serverSig,NULL);
 }
 
-
-DnsReq::DnsReq(int clientFd, const Client_CMD &cmd):clientFd(clientFd),req(cmd)
+int Worker::stat_getSessionNum()
 {
-
+    return this->stat_sessionNum;
 }
+
+void Worker::interrupt()
+{
+    eventfd_write(this->outerSignalFd,WORKER_SIG_STOP);
+    this->workerThread->join();
+    for(auto session: this->sessions)
+    {
+        event_del(&session->aRead);
+        event_del(&session->aWrite);
+        event_del(&session->timer);
+        if(session->b_id>=0)
+        {
+            event_del(&session->bWrite);
+            event_del(&session->bRead);
+        }
+        session->close();
+        if(session->dnsReq)
+        {
+            evdns_getaddrinfo_cancel(session->dnsReq);
+        }
+        delete session;
+    }
+    this->stat_sessionNum = 0;
+    this->sessions.clear();
+    delete this->workerThread;
+    this->workerThread = nullptr;
+}
+
+void Worker::onOuterSig(int fd, short events, void *self_)
+{
+    Worker * self = (Worker*) self_;
+    eventfd_t val;
+    eventfd_read(fd,&val);
+    if(val == WORKER_SIG_STOP)
+    {
+        event_base_loopexit(self->eventBase, NULL);
+        return;
+    }
+}
+
+Worker::~Worker()
+{
+    delete buffer;
+    event_base_free(eventBase);
+    evdns_base_free(evdnsBase,0);
+    if(this->outerSignalFd>0)
+        close(this->outerSignalFd);
+}
+
+
+
+

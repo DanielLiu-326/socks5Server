@@ -10,6 +10,8 @@
 namespace ServerUtil
 {
     int setNonblock(int fd);
+    void BlockSigno(int signo);
+
 }
 
 

@@ -1,36 +1,31 @@
 #include <iostream>
 #include"Socks5Server.h"
-#include<unistd.h>
-#include <signal.h>
-#include"ServerConfigs.h"
-int main(int argc ,char * argv[]) {
-    if(argc == 1)
-    {
-        initServerConfig("./server.config");
-    }
-    else
-    {
-        initServerConfig(argv[1]);
-    }
+int main()
+{
 
-    signal(SIGPIPE, SIG_IGN);
     Socks5Server server;
-    server.id_key = ACCOUNTS;
-    server.init(THREADS,PORT,NULL);
-    server.start();
-    char inputBuffer[256];
+    server.setConfig("./server.config");
+    server.init();
+    server. start();
+    std::string command;
     while(true)
     {
-        std::cin.getline(inputBuffer,sizeof(inputBuffer));
-        std::string in(inputBuffer);
-        if(in=="stop")
+        command ="";
+        std::cin>>command;
+        if(command == "stop"||command == "quit"||command == "exit")
         {
             server.stop();
+            std::cout<<"quit correctly"<<std::endl;
             return 0;
-        }else if(in == "connections")
+        }
+        else if(command == "connection")
         {
-            server.printConNum();
+            auto && load = server.getSessionLoad();
+            for(int i = 0;i<load.size();i++)
+            {
+                std::cout<<"thread"<<i<<" : "<<load[i]<<std::endl;
+            }
         }
     }
-    return -1;
+
 }

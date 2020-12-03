@@ -70,8 +70,8 @@ namespace ServerUtil
             else
             {
                 if (len == buffer.front()->surplus())
-                {                now += len;
-
+                {
+                    now += len;
                     auto x = this->buffer.front();
                     this->buffer.popFront();
                     delete x;
