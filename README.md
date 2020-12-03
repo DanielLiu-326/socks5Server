@@ -1,5 +1,6 @@
 # socks5Server
 a socks5 server based on libevent(Linux only) 
+## 2.0 reformed the code
 ## usage
 `cd src`  
 `cmake`  
